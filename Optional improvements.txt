@@ -1,0 +1,42 @@
+Optional improvements (not required for submission, but can help accuracy)
+A) Teacher model num_classes
+
+In the single-teacher path you create teacher with num_classes=args.nb_classes, but then you load an ImageNet checkpoint that usually has 1000-class head. That can mismatch unless your checkpoint is trained for 200 classes.
+
+If you won’t use single-teacher, ignore this.
+If you might use it, safer is:
+
+teacher_model = create_model(args.teacher_model, pretrained=False, num_classes=1000, global_pool='avg')
+
+
+and adapt similarly (like your multi-teacher does).
+
+B) Warmup for short runs
+
+Your args typically show warmup_lr=1e-6 and warmup_epochs=2. For only 10 epochs, that can slow learning a lot. For short comparisons, set:
+
+--warmup-epochs 0 (or 1)
+
+and/or raise --warmup-lr
+
+This is training config, not code.
+
+C) Add λ logging (for HDTSE transparency)
+
+If you want proof the HDTSE teacher weights are non-trivial, add an occasional print inside MultiTeacherDistillationLoss.forward() (in multiteacher_loss.py). Not required, but nice for reporting.
+
+d)
+⚠️ (4) Not a wiring issue; still a real early-training issue. Needs a small strategy change (warmup uniform λ or ramp alpha).
+
+If you want, tell me which approach you prefer for #4 (uniform-λ warmup or alpha warmup) and I’ll give you the exact minimal patch for multiteacher_loss.py (and where to paste it).
+
+
+5) If you want multi-teacher distillation to beat base earlier, do any 2 of these:
+
+a) Warm-up distillation: first 2–5 epochs set alpha=0.0, then ramp to 0.2–0.5
+(prevents early noisy HDTSE due to random adapter)
+
+b) Delay HDTSE: use uniform lambdas for first N epochs, then enable HDTSE
+(same reason: adapter needs to learn mapping first)
+
+c) Start with higher alpha later: for Tiny-ImageNet, alpha=0.2 is often too weak; try 0.5 after warmup
