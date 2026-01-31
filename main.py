@@ -20,7 +20,6 @@ from timm.utils import NativeScaler, get_state_dict, ModelEma
 from datasets import build_dataset
 from engine import train_one_epoch, evaluate
 from losses import DistillationLoss
-from multiteacher_loss import MultiTeacherDistillationLoss
 from samplers import RASampler
 from augment import new_data_aug_generator
 
@@ -143,9 +142,6 @@ def get_args_parser():
     parser.add_argument('--teacher-model', default='regnety_160', type=str, metavar='MODEL',
                         help='Name of teacher model to train (default: "regnety_160"')
     parser.add_argument('--teacher-path', type=str, default='')
-    parser.add_argument('--teacher-models', type=str, default='',
-                        help='Comma-separated timm model names for multi-teacher distillation')
-
     parser.add_argument('--distillation-type', default='none', choices=['none', 'soft', 'hard'], type=str, help="")
     parser.add_argument('--distillation-alpha', default=0.5, type=float, help="")
     parser.add_argument('--distillation-tau', default=1.0, type=float, help="")
@@ -197,8 +193,8 @@ def main(args):
 
     print(args)
 
-    if args.distillation_type != 'none' and args.finetune and not args.eval and not args.teacher_models:
-        raise NotImplementedError("Finetuning with distillation not yet supported (single-teacher path)")
+    if args.distillation_type != 'none' and args.finetune and not args.eval:
+        raise NotImplementedError("Finetuning with distillation not yet supported")
 
     device = torch.device(args.device)
 
@@ -356,6 +352,8 @@ def main(args):
     optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
 
+    lr_scheduler, _ = create_scheduler(args, optimizer)
+
     criterion = LabelSmoothingCrossEntropy()
 
     if mixup_active:
@@ -370,69 +368,29 @@ def main(args):
         criterion = torch.nn.BCEWithLogitsLoss()
         
     teacher_model = None
-
     if args.distillation_type != 'none':
-        # Allow either teacher-path (single teacher) OR teacher-models (multi teacher)
-        assert (args.teacher_path or args.teacher_models), 'need to specify teacher-path OR teacher-models when using distillation'
-
-        # -----------------------
-        # Multi-teacher distillation
-        # -----------------------
-        if args.teacher_models:
-            teacher_names = [t.strip() for t in args.teacher_models.split(',') if t.strip()]
-            print("✅ Multi-teacher distillation enabled. Teachers:", teacher_names)
-
-            criterion = MultiTeacherDistillationLoss(
-                base_criterion=criterion,
-                student_num_classes=args.nb_classes,
-                teacher_names=teacher_names,
-                distillation_type=args.distillation_type,
-                alpha=args.distillation_alpha,
-                tau=args.distillation_tau,
-                device=device,
-                use_adapter=True,
-            )
-
-            # IMPORTANT: adapter must be trained
-            if hasattr(criterion, "adapter") and criterion.adapter is not None:
-                optimizer.add_param_group({
-                    "params": criterion.adapter.parameters(),
-                    "lr": args.lr,
-                    "weight_decay": 0.0
-                })
-                print("✅ Added adapter parameters to optimizer")
-
-        # -----------------------
-        # Single-teacher distillation (original DeiT)
-        # -----------------------
+        assert args.teacher_path, 'need to specify teacher-path when using distillation'
+        print(f"Creating teacher model: {args.teacher_model}")
+        teacher_model = create_model(
+            args.teacher_model,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            global_pool='avg',
+        )
+        if args.teacher_path.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.teacher_path, map_location='cpu', check_hash=True)
         else:
-            print(f"Creating teacher model: {args.teacher_model}")
-            teacher_model = create_model(
-                args.teacher_model,
-                pretrained=False,
-                num_classes=args.nb_classes,
-                global_pool='avg',
-            )
-            if args.teacher_path.startswith('https'):
-                checkpoint = torch.hub.load_state_dict_from_url(
-                    args.teacher_path, map_location='cpu', check_hash=True)
-            else:
-                checkpoint = torch.load(args.teacher_path, map_location='cpu')
-            teacher_model.load_state_dict(checkpoint['model'])
-            teacher_model.to(device)
-            teacher_model.eval()
+            checkpoint = torch.load(args.teacher_path, map_location='cpu')
+        teacher_model.load_state_dict(checkpoint['model'])
+        teacher_model.to(device)
+        teacher_model.eval()
 
-            criterion = DistillationLoss(
-                criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau
-            )
-
-    else:
-        # No distillation
-        pass
-
-    # Create scheduler AFTER optimizer has all param groups (incl adapter)
-    lr_scheduler, _ = create_scheduler(args, optimizer)
-
+    # wrap the criterion in our custom DistillationLoss, which
+    # just dispatches to the original criterion if args.distillation_type is 'none'
+    criterion = DistillationLoss(
+        criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau
+    )
 
     output_dir = Path(args.output_dir)
     if args.resume:
